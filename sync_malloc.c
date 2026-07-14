@@ -208,7 +208,7 @@ struct heap_core {
 	#endif
 	pthread_mutex_t heap_lock;
 	void *cbrk; // this one will move as the brk is incremented
-	u8 *mem; // this one doesn't move, basically just core + reserved.
+	u8 *mem; // this one doesn't move, always at the base.
 	struct hdr_node *first_free;
 	struct hdr_node *last_free;
 	uintptr_t lowest_mmap_addr;
