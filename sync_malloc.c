@@ -117,16 +117,6 @@
 #define MALLOC_ERR_WRITE(size)
 #endif
 
-// static struct libc_preinit {
-// 	char *preinit_pool;
-// 	u32 preinit_idx;
-// } boots;
-
-// #define IS_BOOTSTRAP(p) \
-// 	((char *)(p) >= boots.preinit_pool && (char *)(p) < (boots.preinit_pool + PREINIT_POOL_BYTES))
-
-static bool malloc_initialized = false;
-
 pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_once_t core_init_lock = PTHREAD_ONCE_INIT;
 
@@ -384,8 +374,6 @@ static void get_libc_malloc_usable_size(void)
 __attribute__((cold))
 void malloc_init(void)
 {
-	malloc_initialized = false;
-
 	void *cur_brk = sbrk(0);
 	if (brk((u8 *)cur_brk + ARENA_MEM_INIT) == -1 && errno == ENOMEM)
 		goto err;
@@ -421,13 +409,10 @@ void malloc_init(void)
 	slab.map_base = (u8 *)aligned_map;
 	slab.map_end = (uintptr_t)(slab.map_base + SLAB_MAX_SIZE);
 
-	// pthread_mutex_init(&slab.lock, NULL);
 	for (usize i = 0; i < SLAB_COUNT; i++) {
 		slab.cores[i].base = slab.map_base + (i * SLAB_SIZE_PER);
-		// pthread_mutex_init(&slab.cores[i].lock, NULL);
 	}
 	core->lowest_mmap_addr = (uintptr_t)slab.cores[0].base;
-	malloc_initialized = true;
 
 	return;
 err:
@@ -451,38 +436,6 @@ void malloc_fini(void)
 }
 
 
-
-// {
-// 	if (!boots.preinit_pool) {
-// 		pthread_mutex_lock(&init_lock);
-// 		if (!boots.preinit_pool) {
-// 			void *boot_map = MMAP_FUNCTION(PREINIT_POOL_BYTES);
-// 			if (boot_map == MAP_FAILED) {
-// 				errno = ENOMEM;
-// 				pthread_mutex_unlock(&init_lock);
-// 				return NULL;
-// 			}
-// 			boots.preinit_pool = boot_map;
-// 		}
-// 		pthread_mutex_unlock(&init_lock);
-// 	}
-//
-// 	boots.preinit_idx = (boots.preinit_idx + 15) & ~15;
-// 	if (boots.preinit_idx + sz > PREINIT_POOL_BYTES) {
-// 		fprintf(stderr,
-// 		        "bootstrap exhausted: idx=%u sz=%zu limit=%u\n",
-// 		        boots.preinit_idx,
-// 		        sz,
-// 		        PREINIT_POOL_BYTES);
-// 		errno = ENOMEM;
-// 		return NULL;
-// 	}
-// 	void *ptr = boots.preinit_pool + boots.preinit_idx;
-// 	boots.preinit_idx += sz;
-// 	return ptr;
-// }
-
-
 _Noreturn void die(int err, const char *str)
 {
 	write(STDERR_FILENO, str, strlen(str));
@@ -502,8 +455,6 @@ static int pool_inc_brk(const intptr_t upto_sz)
 			break;
 		}
 		#endif
-		// } while ((cur_sz - core->reserved - core->offset)
-		//          < (core->heap_size - core->used_size) + upto_sz);
 	} while ((cur_sz - core->reserved - core->offset)
 	         < ((uintptr_t)upto_sz + sizeof(struct hdr_node)));
 
@@ -680,10 +631,6 @@ static ptrdiff_t find_block_free(usize *sz)
 		*sz = block_size - sizeof(struct hdr_node);
 	}
 
-	// Prevents partial block splitting until splitting is implemented.
-	// if (curr->size > *sz)
-	// 	*sz = curr->size - sizeof(struct hdr_node);
-
 	return (ptrdiff_t)curr - (ptrdiff_t)core->mem;
 }
 
@@ -733,7 +680,6 @@ done:
 __attribute__((hot))
 static bool malloc_bounds_check(void *ptr)
 {
-	// if (IS_BOOTSTRAP(ptr)) return true;
 	if (!core) return false;
 
 	const uintptr_t start = (uintptr_t)core->mem;
@@ -803,8 +749,6 @@ static int slab_get_idx(usize sz)
 __attribute_nonnull__((1))
 static int get_slab_arr_idx(void *uptr)
 {
-	// if (!((addr >= (uintptr_t)slab.map_base) && (addr < slab.map_end)))
-	// 	return -1;
 	if (!is_in_slabs(uptr)) return -1;
 	const uintptr_t offs = (((uintptr_t)uptr & ~0x3FFFULL)
 	                        - (uintptr_t)slab.map_base);
@@ -910,9 +854,6 @@ void free(void *ptr)
 		if (libc_free) libc_free(ptr);
 		return;
 	}
-	// if (IS_BOOTSTRAP(ptr))
-		// return;
-
 	CORE_INC_DEBUG(frees);
 	struct hdr_node *ph = get_node(ptr);
 
@@ -954,8 +895,6 @@ __attribute__((hot, visibility("default"), malloc(free, 1)))
 void *malloc(size_t sz)
 {
 	TRIGGER_CORE_INIT;
-	// if (!malloc_initialized)
-	// 	return bootstrap_bump(sz);
 	if (sz > ALLOC_MAX_SZ) {
 		errno = ENOMEM;
 		return NULL;
@@ -1021,20 +960,6 @@ void *realloc(void *ptr, size_t sz)
 		return malloc(0);
 	}
 
-	// if (IS_BOOTSTRAP(ptr)) {
-	// 	newptr = malloc(sz);
-	// 	if (!newptr) {
-	// 		errno = ENOMEM;
-	// 		MALLOC_ERR_WRITE(sz);
-	// 		return NULL;
-	// 	}
-	// 	const usize old_sz = (boots.preinit_pool
-	// 	                      + PREINIT_POOL_BYTES) - (char *)ptr;
-	// 	const usize copy_sz = (sz < old_sz) ? sz : old_sz;
-	// 	memcpy(newptr, ptr, copy_sz);
-	// 	return newptr;
-	// }
-
 	newptr = malloc(sz);
 	if (!newptr) {
 		errno = ENOMEM;
@@ -1042,11 +967,7 @@ void *realloc(void *ptr, size_t sz)
 		return NULL;
 	}
 
-	usize copy_sz = 0;
-	// const struct hdr_node *ptr_hdr = get_node(ptr);
-
-	copy_sz = malloc_usable_size(ptr);
-
+	const usize copy_sz = malloc_usable_size(ptr);
 	memcpy(newptr, ptr, copy_sz > sz ? sz : copy_sz);
 	if (ptr != newptr)
 		free(ptr);
@@ -1058,11 +979,6 @@ void *realloc(void *ptr, size_t sz)
 __attribute__((hot, visibility("default"), malloc(free, 1)))
 void *calloc(size_t n_elem, size_t elem_sz)
 {
-	// if (!malloc_initialized) {
-	// 	void *ptr = bootstrap_bump(n_elem * elem_sz);
-	// 	if (ptr) memset(ptr, 0, n_elem * elem_sz);
-	// 	return ptr;
-	// }
 	if (!n_elem || !elem_sz)
 		return malloc(0);
 
