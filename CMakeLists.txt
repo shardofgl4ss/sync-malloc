@@ -3,7 +3,7 @@ project(malloc C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_FLAGS ${CMAKE_C_FLAGS} "-Wall -Wextra -fno-omit-frame-pointer -ffreestanding -Wno-format-security -Wno-unused-parameter -Wshadow -Werror=strict-prototypes -Werror=implicit -Werror=return-type -Werror=incompatible-pointer-types -Wfloat-conversion -Wno-ignored-attributes")
+set(CMAKE_C_FLAGS ${CMAKE_C_FLAGS} "-Wall -Wextra -fno-omit-frame-pointer -ffreestanding -Wno-format-security -Wshadow -Werror=strict-prototypes -Werror=implicit -Werror=return-type -Werror=incompatible-pointer-types -Wfloat-conversion -Wno-ignored-attributes")
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -ggdb3 -O0")
 # The allocator won't function right if -fno-strict-aliasing is removed on -O3 optimizations.
 set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -fno-strict-aliasing -march=native -mtune=native")
