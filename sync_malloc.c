@@ -154,6 +154,7 @@ struct ghosthdr;
 struct hdr_node;
 struct slab_core;
 struct slab_controller;
+struct thread_cache;
 
 
 void malloc_init(void);
@@ -216,7 +217,6 @@ struct heap_core {
 	u64 offset;
 	u64 heap_size;
 	u64 used_size;
-	u64 reserved;
 	u32 map_count;
 	u32 free_count;
 } __attribute__((aligned(128)));
@@ -263,6 +263,10 @@ struct slab_controller {
 	uintptr_t map_end;
 } __attribute__((aligned(128)));
 
+static thread_local struct thread_cache {
+	u32 slab_index_cache; // to replace the one in slab_allocate_obj().
+} tcache;
+
 
 #define X(id, v) \
 	{{}, PTHREAD_MUTEX_INITIALIZER, NULL, 1U << slab_shift[id], SLAB_SIZE_PER >> slab_shift[id]},
@@ -305,7 +309,21 @@ enum {
 };
 
 // Clion was complaining this may be null, hence the attribute. It should never be.
-static struct heap_core *core __attribute__((nonnull));
+static struct heap_core core = {
+	.heap_lock = PTHREAD_MUTEX_INITIALIZER,
+	.cbrk = NULL,
+	.mem = NULL,
+	.first_free = NULL,
+	.last_free = NULL,
+	.lowest_mmap_addr = 0,
+	.highest_mmap_addr = 0,
+	.recent_free_sizes = {},
+	.offset = 0,
+	.heap_size = 0,
+	.used_size = 0,
+	.map_count = 0,
+	.free_count = 0
+};
 
 #if defined(DEBUG)
 	#define CORE_INC_DEBUG(var) core->dbg.var++
@@ -358,6 +376,7 @@ static void get_libc_malloc_usable_size(void)
 	if (libc_malloc_usable_size) return;
 	pthread_mutex_lock(&init_lock);
 	if (libc_malloc_usable_size) {
+		// not sure if a double check is needed. maybe?
 		pthread_mutex_unlock(&init_lock);
 		return;
 	}
@@ -379,18 +398,16 @@ void malloc_init(void)
 		goto err;
 
 	// the brk origin for resetting is core itself.
-	core = cur_brk;
-	core->heap_size = ARENA_MEM_INIT;
-	core->cbrk = (u8 *)cur_brk + ARENA_MEM_INIT;
-	core->reserved = sizeof(struct heap_core);
-	core->mem = (u8 *)core + core->reserved;
-
-	pthread_mutex_init(&core->heap_lock, NULL);
+	core.mem = cur_brk;
+	core.heap_size = ARENA_MEM_INIT;
+	core.cbrk = (u8 *)cur_brk + ARENA_MEM_INIT;
+	// core.reserved = sizeof(struct heap_core);
+	// core.mem = (u8 *)core + core->reserved;
 
 	void *map = MMAP_FUNCTION(SLAB_MAX_SIZE + SLAB_SIZE_PER);
 	if (map == MAP_FAILED) {
 		errno = ENOMEM;
-		brk(core);
+		brk(core.mem);
 		goto err;
 	}
 	const uintptr_t aligned_map = ((uintptr_t)map + (SLAB_SIZE_PER - 1))
@@ -402,7 +419,7 @@ void malloc_init(void)
 	if (tail) munmap((void *)(aligned_map + SLAB_MAX_SIZE), tail);
 
 	if ((uintptr_t)slab.map_base % 0x4000 != 0) {
-		brk(core);
+		brk(core.mem);
 		die(ERR_MAP_ALIGN, PRINTERR(ERR_MAP_ALIGN, ERR_MAP_ALIGN_STR));
 	}
 
@@ -412,7 +429,7 @@ void malloc_init(void)
 	for (usize i = 0; i < SLAB_COUNT; i++) {
 		slab.cores[i].base = slab.map_base + (i * SLAB_SIZE_PER);
 	}
-	core->lowest_mmap_addr = (uintptr_t)slab.cores[0].base;
+	core.lowest_mmap_addr = (uintptr_t)slab.cores[0].base;
 
 	return;
 err:
@@ -420,7 +437,7 @@ err:
 }
 
 
-__attribute__((destructor))
+__attribute__((cold, destructor))
 void malloc_fini(void)
 {
 	// We can't clean up the heap as it turns out,
@@ -429,13 +446,14 @@ void malloc_fini(void)
 	// clean it up, even if this destructor is called last.
 	// We can clean up the mutexes though.
 	pthread_mutex_destroy(&init_lock);
-	pthread_mutex_destroy(&core->heap_lock);
+	pthread_mutex_destroy(&core.heap_lock);
 	for (uint i = 0; i < SLAB_COUNT - 1; i++) {
 		pthread_mutex_destroy(&slab.cores[i].lock);
 	}
 }
 
 
+__attribute__((cold))
 _Noreturn void die(int err, const char *str)
 {
 	write(STDERR_FILENO, str, strlen(str));
@@ -444,9 +462,10 @@ _Noreturn void die(int err, const char *str)
 }
 
 
+__attribute__((cold))
 static int pool_inc_brk(const intptr_t upto_sz)
 {
-	uintptr_t cur_sz = (intptr_t)core->heap_size;
+	uintptr_t cur_sz = (intptr_t)core.heap_size;
 	do {
 		cur_sz *= 2;
 		#if ARENA_MEM_LIMIT > 0
@@ -455,10 +474,10 @@ static int pool_inc_brk(const intptr_t upto_sz)
 			break;
 		}
 		#endif
-	} while ((cur_sz - core->reserved - core->offset)
+	} while ((cur_sz - core.offset)
 	         < ((uintptr_t)upto_sz + sizeof(struct hdr_node)));
 
-	const uintptr_t inc = cur_sz - core->heap_size;
+	const uintptr_t inc = cur_sz - core.heap_size;
 
 	void *tmp = sbrk((intptr_t)inc);
 
@@ -466,15 +485,15 @@ static int pool_inc_brk(const intptr_t upto_sz)
 		errno = ENOMEM;
 		return 1;
 	}
-	if (tmp != core->cbrk) {
+	if (tmp != core.cbrk) {
 		// absorb the malignant growth.
-		const ptrdiff_t gap = (u8 *)tmp - (u8 *)core->cbrk;
-		core->offset += gap;
-		core->heap_size += gap;
+		const ptrdiff_t gap = (u8 *)tmp - (u8 *)core.cbrk;
+		core.offset += gap;
+		core.heap_size += gap;
 	}
 
-	core->cbrk = (u8 *)tmp + inc;
-	core->heap_size += inc;
+	core.cbrk = (u8 *)tmp + inc;
+	core.heap_size += inc;
 
 	CORE_INC_DEBUG(brk_increments);
 
@@ -482,6 +501,7 @@ static int pool_inc_brk(const intptr_t upto_sz)
 }
 
 
+__attribute__((hot))
 static struct hdr_node *get_node(void *uptr)
 {
 	if (is_in_slabs(uptr))
@@ -507,7 +527,7 @@ static void *allocate_brk_mem(void **npptr,
 {
 	const int flags = (!p_offs) ? F_FIRST | F_ALLOCATED : F_ALLOCATED;
 	const usize true_sz = sz + sizeof(struct hdr_node);
-	struct hdr_node *new_node = (void *)(core->mem + p_offs);
+	struct hdr_node *new_node = (void *)(core.mem + p_offs);
 
 	const bool set_coreoffs = !(new_node->flags & F_FREE);
 
@@ -517,9 +537,9 @@ static void *allocate_brk_mem(void **npptr,
 	new_node->hdr.pad = HDR_MAGIC;
 	new_node->hdr.used = (pflags & F_EMPTY) ? 0 : old_sz;
 
-	if (set_coreoffs) core->offset += true_sz;
+	if (set_coreoffs) core.offset += true_sz;
 
-	core->used_size += sz;
+	core.used_size += sz;
 
 	CORE_INC_DEBUG(allocs);
 	*npptr = (u8 *)new_node + sizeof(struct hdr_node);
@@ -531,10 +551,10 @@ static void detach_free_node(struct hdr_node *node, struct hdr_node *prev)
 {
 	if (prev == NULL) {
 		if (node->free.next) {
-			core->first_free = node->free.next;
+			core.first_free = node->free.next;
 		} else {
-			core->first_free = NULL;
-			core->last_free = NULL;
+			core.first_free = NULL;
+			core.last_free = NULL;
 		}
 		goto done;
 	}
@@ -542,11 +562,11 @@ static void detach_free_node(struct hdr_node *node, struct hdr_node *prev)
 		prev->free.next = node->free.next;
 	} else {
 		prev->free.next = NULL;
-		core->last_free = prev;
+		core.last_free = prev;
 	}
 done:
 	node->free.next = NULL;
-	core->free_count--;
+	core.free_count--;
 }
 
 
@@ -554,7 +574,7 @@ static void attach_free_node(struct hdr_node *node)
 {
 	if (!node) return;
 
-	struct hdr_node *curr = core->first_free;
+	struct hdr_node *curr = core.first_free;
 	struct hdr_node *prev = NULL;
 
 	while (curr && curr < node) {
@@ -570,14 +590,14 @@ static void attach_free_node(struct hdr_node *node)
 			prev->size += node->size;
 			prev->free.next = curr;
 			node = prev;
-			core->free_count--;
+			core.free_count--;
 		}
 	} else {
-		core->first_free = node;
+		core.first_free = node;
 	}
 
 	if (!curr) {
-		core->last_free = node;
+		core.last_free = node;
 		return;
 	}
 
@@ -586,9 +606,9 @@ static void attach_free_node(struct hdr_node *node)
 
 	node->size += curr->size;
 	node->free.next = curr->free.next;
-	core->free_count--;
-	if (core->last_free == curr)
-		core->last_free = node;
+	core.free_count--;
+	if (core.last_free == curr)
+		core.last_free = node;
 }
 
 
@@ -596,10 +616,10 @@ static void attach_free_node(struct hdr_node *node)
 __attribute__((hot))
 static ptrdiff_t find_block_free(usize *sz)
 {
-	if (core->free_count == 0)
+	if (core.free_count == 0)
 		return NO_BLOCK;
 
-	struct hdr_node *curr = core->first_free;
+	struct hdr_node *curr = core.first_free;
 	struct hdr_node *prev = NULL;
 
 	while (curr->size - sizeof(struct hdr_node) < *sz) {
@@ -608,7 +628,7 @@ static ptrdiff_t find_block_free(usize *sz)
 		curr = curr->free.next;
 	};
 
-	if (core->first_free == curr)
+	if (core.first_free == curr)
 		prev = NULL;
 	detach_free_node(curr, prev);
 
@@ -625,13 +645,13 @@ static ptrdiff_t find_block_free(usize *sz)
 
 		curr->size = req_size;
 		*sz = req_size - sizeof(struct hdr_node);
-		core->free_count++;
+		core.free_count++;
 		attach_free_node(split);
 	} else {
 		*sz = block_size - sizeof(struct hdr_node);
 	}
 
-	return (ptrdiff_t)curr - (ptrdiff_t)core->mem;
+	return (ptrdiff_t)curr - (ptrdiff_t)core.mem;
 }
 
 
@@ -640,12 +660,12 @@ __attribute__((hot))
 static ptrdiff_t find_block_offs(const usize *sz)
 {
 	const usize true_sz = *sz + sizeof(struct hdr_node);
-	const usize core_true_sz = core->heap_size - core->reserved;
+	const usize core_true_sz = core.heap_size;
 
-	if (true_sz > core_true_sz - core->offset)
+	if (true_sz > core_true_sz - core.offset)
 		return NO_BLOCK;
 
-	return (ptrdiff_t)core->offset;
+	return (ptrdiff_t)core.offset;
 }
 
 
@@ -680,16 +700,16 @@ done:
 __attribute__((hot))
 static bool malloc_bounds_check(void *ptr)
 {
-	if (!core) return false;
+	if (!core.mem) return false;
 
-	const uintptr_t start = (uintptr_t)core->mem;
-	const uintptr_t end = (uintptr_t)((u8 *)core + core->heap_size);
+	const uintptr_t start = (uintptr_t)core.mem;
+	const uintptr_t end = (uintptr_t)(core.mem + core.heap_size);
 	const uintptr_t addr = (uintptr_t)ptr;
 	if (addr >= start && addr < end)
 		return true;
 	if (is_in_slabs(ptr))
 		return true;
-	if (addr >= core->lowest_mmap_addr && addr < core->highest_mmap_addr)
+	if (addr >= core.lowest_mmap_addr && addr < core.highest_mmap_addr)
 		return true;
 	return false;
 }
@@ -717,14 +737,14 @@ static int arena_allocate_map(void **npptr, const usize sz, u16 flags)
 	map_node->flags |= (F_MAP | F_ALLOCATED | flags);
 	map_node->magic = HDR_MAGIC;
 	*npptr = map_node->map.user_ptr;
-	core->map_count++;
+	core.map_count++;
 	CORE_INC_DEBUG(allocs);
 
 	const uintptr_t map_addr = (uintptr_t)map_node;
-	if (map_addr < core->lowest_mmap_addr)
-		core->lowest_mmap_addr = map_addr;
-	if (map_addr + new_sz > core->highest_mmap_addr)
-		core->highest_mmap_addr = map_addr + new_sz;
+	if (map_addr < core.lowest_mmap_addr)
+		core.lowest_mmap_addr = map_addr;
+	if (map_addr + new_sz > core.highest_mmap_addr)
+		core.highest_mmap_addr = map_addr + new_sz;
 	return 0;
 err:
 	errno = ENOMEM;
@@ -862,10 +882,10 @@ void free(void *ptr)
 		slab_deallocate_obj(ptr);
 		return;
 	}
-	pthread_mutex_lock(&core->heap_lock);
+	pthread_mutex_lock(&core.heap_lock);
 	if (ph->flags & F_MAP) {
 		munmap(ph, ph->size);
-		core->map_count--;
+		core.map_count--;
 		goto done;
 	}
 
@@ -874,17 +894,17 @@ void free(void *ptr)
 	ph->flags |= F_FREE;
 	ph->free.next = NULL;
 
-	if (!core->first_free) {
-		core->first_free = ph;
-		core->last_free = ph;
+	if (!core.first_free) {
+		core.first_free = ph;
+		core.last_free = ph;
 	} else {
 		attach_free_node(ph);
 	}
 
-	core->used_size -= free_hdr_used;
-	core->free_count++;
+	core.used_size -= free_hdr_used;
+	core.free_count++;
 done:
-	pthread_mutex_unlock(&core->heap_lock);
+	pthread_mutex_unlock(&core.heap_lock);
 
 	// TODO implement using cache first instead of freelist
 }
@@ -916,16 +936,16 @@ void *malloc(size_t sz)
 		}
 		newptr = NULL;
 	}
-	pthread_mutex_lock(&core->heap_lock);
+	pthread_mutex_lock(&core.heap_lock);
 	if (new_sz >= MAP_THRESHOLD) {
 		arena_allocate_map(&newptr, new_sz, pflags);
 		goto done;
 	}
 
-	if (new_sz > core->heap_size - core->reserved - core->used_size) {
+	if (new_sz > core.heap_size - core.used_size) {
 		if (pool_inc_brk((intptr_t)new_sz)) {
 			errno = ENOMEM;
-			pthread_mutex_unlock(&core->heap_lock);
+			pthread_mutex_unlock(&core.heap_lock);
 			return NULL;
 		}
 	}
@@ -935,7 +955,7 @@ done:
 		errno = ENOMEM;
 		MALLOC_ERR_WRITE(sz);
 	}
-	pthread_mutex_unlock(&core->heap_lock);
+	pthread_mutex_unlock(&core.heap_lock);
 	return newptr;
 }
 
